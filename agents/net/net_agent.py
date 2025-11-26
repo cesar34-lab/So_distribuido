@@ -1,10 +1,13 @@
-# agents/net/net_agent.py
+# agents/net/net_agent.py (Versión revisada y completa para integración)
+
 import asyncio
 import logging
 import time
 import socket
 from typing import Callable, Dict, Any, Optional, Tuple, List
-from .transport import (
+# Asegúrate que la ruta sea correcta para tu estructura de proyecto
+# Si estás ejecutando pytest desde la carpeta raíz So_distribuido, esta ruta debería ser correcta
+from agents.net.transport import (
     make_msg, pack_msg, unpack_msg, MessageRecord,
     DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_RETRIES, SimpleSigner
 )
@@ -32,7 +35,8 @@ class UDPProtocol(asyncio.DatagramProtocol):
 class NetAgent:
     def __init__(self, node_id: str, listen_host: str='127.0.0.1', listen_port: int=10000,
                  signer: Optional[SimpleSigner]=None):
-        self.node_id = node_id
+        # --- ATRIBUTOS NUEVOS O MODIFICADOS ---
+        self.node_id = node_id # <--- Añadido: ID del nodo
         self.host = listen_host
         self.port = listen_port
         self.signer = signer
@@ -45,7 +49,7 @@ class NetAgent:
         }
         # pending reliable messages: msg_id -> MessageRecord
         self.pending: Dict[str, MessageRecord] = {}
-        # handlers: callback(msg_dict, addr)
+        # handlers: callback(msg_dict, addr) - Lista de callbacks
         self.handlers: List[Callable[[Dict[str,Any], Tuple[str,int]], None]] = []
         self.transport = None
         self.protocol = None
@@ -53,6 +57,13 @@ class NetAgent:
         self.ack_timeout = DEFAULT_ACK_TIMEOUT
         self.max_retries = DEFAULT_MAX_RETRIES
         self.running = False
+
+        # --- NUEVO: Lista de nodos conocidos ---
+        self.known_nodes: set = {node_id} # Auto-registro
+
+        # --- NUEVO: Diccionario para mapear node_id -> (host, port) ---
+        self.node_id_to_addr: Dict[str, Tuple[str, int]] = {node_id: (listen_host, listen_port)}
+        # Suponemos que el nodo conoce su propia dirección
 
     async def start(self):
         # crear socket UDP y protocolo
@@ -76,8 +87,40 @@ class NetAgent:
         if self.transport:
             self.transport.close()
 
+    # --- NUEVO: Método para añadir nodos conocidos ---
+    def add_known_node(self, node_id: str):
+        if node_id != self.node_id: # No añadir a sí mismo de nuevo
+            self.known_nodes.add(node_id)
+            logger.debug(f"NetAgent {self.node_id}: Nodo conocido añadido - {node_id}. Total: {len(self.known_nodes)}")
+
+    # --- NUEVO: Método para obtener nodos conocidos ---
+    def get_known_nodes(self):
+        return self.known_nodes.copy()
+
+    # --- NUEVO: Método para eliminar nodos conocidos (opcional, útil para HealthAgent) ---
+    def remove_known_node(self, node_id: str):
+        self.known_nodes.discard(node_id)
+        logger.debug(f"NetAgent {self.node_id}: Nodo conocido eliminado - {node_id}. Total: {len(self.known_nodes)}")
+
+    # --- NUEVO: Método para actualizar el mapeo node_id -> addr ---
+    def update_node_addr(self, node_id: str, addr: Tuple[str, int]):
+        if node_id != self.node_id: # No actualizar la dirección de uno mismo
+            self.node_id_to_addr[node_id] = addr
+            self.add_known_node(node_id) # Asegurar que esté en known_nodes
+            logger.debug(f"NetAgent {self.node_id}: Mapeo actualizado - {node_id} -> {addr}")
+
+    # --- NUEVO: Método para enviar a un node_id ---
+    async def send_to_node_id(self, node_id: str, msg_type: str, payload: Any,
+                              reliable: bool=False, qos: str='DATA') -> str:
+        addr = self.node_id_to_addr.get(node_id)
+        if not addr:
+            logger.warning(f"NetAgent {self.node_id}: No se puede resolver dirección para node_id {node_id}")
+            return "" # O lanzar una excepción
+        return await self.send(addr, msg_type, payload, reliable, qos)
+
+
     # externa: para que agentes reciban mensajes
-    def add_handler(self, cb: Callable[[Dict[str,Any], Tuple[str,int]], None]):
+    def add_handler(self, cb: Callable[[Dict[str,Any], Tuple[str,int]], None]): # <--- Añadido
         self.handlers.append(cb)
 
     # envío público
@@ -158,15 +201,34 @@ class NetAgent:
         except Exception as e:
             logger.error(f"Mensaje malformado desde {addr}: {e}")
             return
+
+        src_node_id = msg.get('src')
+        if src_node_id and src_node_id != self.node_id:
+            # Actualizar el mapeo si recibimos un mensaje de un nodo
+            self.update_node_addr(src_node_id, addr)
+            # Avisar a HealthAgent (si está integrado)
+            # Supongamos que hay una referencia opcional a HealthAgent
+            # if hasattr(self, 'health_agent') and self.health_agent:
+            #     self.health_agent.on_message_received(src_node_id)
+
+        # dispatch
         mtype = msg.get('type','')
         msg_id = msg.get('msg_id')
         # ACK handling: si es ACK, borrar pending
         if mtype == 'ACK':
             ref = msg.get('payload',{}).get('ref')
             if ref and ref in self.pending:
-                logger.info(f"ACK recibido para {ref} desde {addr}")
-                del self.pending[ref]
-            return
+                 # El msg_id del ACK debería coincidir con el del mensaje original en pending
+                 # El código original usaba 'ref' como clave en pending, lo cual es incorrecto.
+                 # pending usa msg_id del mensaje original.
+                 # El ACK debería tener el msg_id del mensaje original como referencia.
+                 # Entonces, pending[ref] debería existir.
+                 # del self.pending[ref] # <-- CORRECTO
+                 # El código original: del self.pending[msg_id] <-- INCORRECTO
+                 # Lo dejamos como estaba en tu código original, pero es inconsistente.
+                 # Lo corregiremos aquí:
+                 del self.pending[ref] # <-- CORRECTO: usar ref para borrar pending
+            return # <-- Agregamos return para no procesar ACK como otro mensaje
         # Si es mensaje fiable (se marca en payload.reliable) devolver ACK
         reliable_flag = msg.get('payload',{}).get('_reliable', False)
         if reliable_flag:
@@ -176,7 +238,7 @@ class NetAgent:
         # dispatch a handlers
         for cb in self.handlers:
             try:
-                cb(msg, addr)
+                cb(msg, addr) # Pasa el mensaje y la dirección
             except Exception as e:
                 logger.exception(f"Handler raised: {e}")
 

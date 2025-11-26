@@ -1,16 +1,14 @@
-# agents/store_d/store.py
+# agents/store_d/store.py (Modificaciones sugeridas)
 
+# ... (importaciones existentes) ...
 import os
 import json
 import hashlib
 import time
 import asyncio
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-
-# Asumimos que NetAgent está disponible para enviar/recibir mensajes
-# y que el protocolo está definido en algún lugar común.
-# Este es un ejemplo de cómo podría integrarse.
+from typing import Optional, List, Dict, Any, Tuple
+import uuid # Para generar msg_id en mensajes de red
 
 class StoreD:
     def __init__(self, node_id: str, net_agent, storage_dir: str = "store_local", meta_file: str = "store_meta.json", r_copies: int = 3, gc_ttl: int = 3600):
@@ -26,7 +24,7 @@ class StoreD:
             gc_ttl (int): Tiempo en segundos antes de que un objeto sin referencias sea candidato a GC.
         """
         self.node_id = node_id
-        self.net_agent = net_agent
+        self.net_agent = net_agent # <--- Nuevo parámetro
         self.storage_dir = Path(storage_dir)
         self.meta_file_path = Path(meta_file)
         self.r_copies = r_copies
@@ -37,6 +35,9 @@ class StoreD:
 
         # Cargar o inicializar metadatos
         self.metadata: Dict[str, Any] = self._load_metadata()
+
+        # --- Registrar este agente como handler en NetAgent ---
+        self.net_agent.add_handler(self.handle_message)
 
     def _load_metadata(self) -> Dict[str, Any]:
         """Carga los metadatos desde el archivo JSON."""
@@ -108,6 +109,7 @@ class StoreD:
         """
         return self.metadata.get(obj_hash, {}).get("replicas", [])
 
+
     async def get(self, obj_hash: str) -> Optional[bytes]:
         """
         Recupera un objeto por su hash. Primero busca localmente, luego en la red.
@@ -123,33 +125,13 @@ class StoreD:
         # 1. Buscar localmente
         if file_path.exists():
             print(f"[Store-D] Encontrado localmente: {obj_hash}")
-            # NO incrementamos refcount aquí. Solo lo hacemos si lo obtenemos de otro nodo.
-            # Si es un 'get' que se usa para *leer* localmente, no debería afectar refcount.
-            # El refcount se incrementa cuando se *usa* el objeto en una operación como una tarea.
-            # Para simplificar el test, asumiremos que get() no incrementa refcount local.
-            # Si se quisiera que get() incrementara refcount local, habría que descomentar la línea de abajo.
-            # if obj_hash in self.metadata:
-            #     self.metadata[obj_hash]["refcount"] += 1
-            #     self._save_metadata()
             with open(file_path, 'rb') as f:
                 return f.read()
 
         # 2. Buscar remotamente
         print(f"[Store-D] No encontrado localmente: {obj_hash}. Buscando en la red...")
-        # Primero, intentar con nodos conocidos que reportaron tenerlo
-        candidate_nodes = self.list_replicas(obj_hash)
-
-        # Si no hay nodos conocidos con el hash en metadatos, debemos buscarlo activamente.
-        # En un sistema real, usaríamos una DHT o un mensaje tipo STORE_FIND.
-        # Por ahora, en el simulador, asumiremos que si no está en metadatos, debemos preguntar a otros nodos.
-        # Para pruebas, el MockNetAgent puede simular que ciertos hashes están disponibles en otros nodos.
-        # Usaremos una lógica simple: si no está en metadatos, preguntaremos a todos los nodos conocidos.
-        # Para simplificar, usaremos los nodos conocidos por el NetAgent.
-        if not candidate_nodes:
-            # Obtener nodos conocidos del agente de red (esto debe integrarse con DiscoverAgent en la realidad)
-            all_known_nodes = getattr(self.net_agent, 'known_nodes', set())
-            candidate_nodes = [n for n in all_known_nodes if n != self.node_id]
-            print(f"[Store-D] Hash {obj_hash} no está en metadatos. Buscando entre nodos conocidos: {candidate_nodes}")
+        # Usar nodos conocidos de NetAgent
+        candidate_nodes = [n for n in self.net_agent.get_known_nodes() if n != self.node_id]
 
         if not candidate_nodes:
             print(f"[Store-D] No hay nodos conocidos para buscar {obj_hash}")
@@ -160,68 +142,73 @@ class StoreD:
                 continue # Ya verificamos localmente
 
             print(f"[Store-D] Intentando obtener {obj_hash} de {node_id}")
-            # Enviar mensaje STORE_GET
-            request_msg = {
-                "magic": "SOD1",
-                "type": "STORE_GET",
-                "src": self.node_id,
-                "dst": node_id,
-                "msg_id": f"get_{obj_hash}_{int(time.time())}",
-                "timestamp": int(time.time()),
-                "payload": {"hash": obj_hash}
+            # Enviar mensaje STORE_GET usando send_to_node_id
+            request_msg_payload = {
+                "hash": obj_hash
             }
 
             try:
-                # Enviar el mensaje y esperar respuesta (esto requiere que NetAgent maneje el envío y recepción de respuestas)
-                # Supongamos que net_agent.send_request espera una respuesta específica
-                response = await self.net_agent.send_request(request_msg, timeout=5.0)
-                if response and response.get("type") == "STORE_FOUND" and response.get("payload", {}).get("hash") == obj_hash:
-                    data_bytes = bytes.fromhex(response["payload"]["data"]) # Asumiendo que los datos se envían como hex
-                    print(f"[Store-D] Obtenido {obj_hash} de {node_id}")
+                # Enviar el mensaje a través de NetAgent usando node_id
+                msg_id_sent = await self.net_agent.send_to_node_id(
+                    node_id, "STORE_GET", request_msg_payload, reliable=False, qos='DATA'
+                )
+                if not msg_id_sent:
+                    print(f"[Store-D] Fallo al enviar STORE_GET a {node_id}")
+                    continue
 
-                    # Guardar localmente
-                    local_file_path = self.storage_dir / obj_hash
-                    with open(local_file_path, 'wb') as f:
-                        f.write(data_bytes)
+                # Aquí necesitamos un mecanismo para esperar la respuesta específica.
+                # Usaremos una cola o diccionario para asociar la solicitud con la respuesta futura.
+                # Crear un asyncio.Event para esta solicitud
+                response_event = asyncio.Event()
+                response_data = None
+                # Registrar la solicitud pendiente
+                if not hasattr(self, '_pending_get_requests'):
+                    self._pending_get_requests = {}
+                self._pending_get_requests[msg_id_sent] = {'event': response_event, 'data': None, 'node_id': node_id}
 
-                    # Actualizar metadatos localmente
-                    if obj_hash not in self.metadata:
-                        self.metadata[obj_hash] = {
-                            "replicas": [node_id], # Nodo de origen
-                            "refcount": 1, # Almacenado localmente por primera vez, refcount es 1
-                            "timestamp": int(time.time())
-                        }
+                # Esperar la respuesta con timeout
+                try:
+                    await asyncio.wait_for(response_event.wait(), timeout=5.0)
+                    # La respuesta debería haber sido manejada por handle_message y haber liberado el evento
+                    stored_response = self._pending_get_requests.pop(msg_id_sent, None)
+                    if stored_response and stored_response['data']:
+                        data_bytes = stored_response['data']
+                        print(f"[Store-D] Obtenido {obj_hash} de {node_id}")
+
+                        # Guardar localmente
+                        local_file_path = self.storage_dir / obj_hash
+                        with open(local_file_path, 'wb') as f:
+                            f.write(data_bytes)
+
+                        # Actualizar metadatos localmente
+                        if obj_hash not in self.metadata:
+                            self.metadata[obj_hash] = {
+                                "replicas": [node_id],
+                                "refcount": 1,
+                                "timestamp": int(time.time())
+                            }
+                        else:
+                            self.metadata[obj_hash]["refcount"] += 1
+                            if node_id not in self.metadata[obj_hash]["replicas"]:
+                                self.metadata[obj_hash]["replicas"].append(node_id)
+
+                        self._save_metadata()
+                        return data_bytes
                     else:
-                        # Si ya existía en metadatos (por ejemplo, por replicación o descubrimiento), solo incrementamos refcount
-                        # y agregamos el nodo de origen si no estaba
-                        self.metadata[obj_hash]["refcount"] += 1
-                        if node_id not in self.metadata[obj_hash]["replicas"]:
-                            self.metadata[obj_hash]["replicas"].append(node_id)
-
-                    self._save_metadata()
-                    return data_bytes
-                elif response and response.get("type") == "STORE_NOT_FOUND":
-                     print(f"[Store-D] Nodo {node_id} no tiene {obj_hash}")
-                     # Opcional: Actualizar metadatos locales si el nodo reporta que ya no lo tiene
-                     # Si el nodo era el único en la lista de réplicas locales, podría borrarlo de metadatos locales
-                     if obj_hash in self.metadata and node_id in self.metadata[obj_hash]["replicas"]:
-                         self.metadata[obj_hash]["replicas"].remove(node_id)
-                         if not self.metadata[obj_hash]["replicas"]:
-                             # Si no quedan réplicas conocidas en la lista local, podría marcarlo de alguna manera
-                             # o dejarlo si refcount > 0. Para GC, solo borramos si refcount=0 y TTL.
-                             # Por ahora, no borramos metadatos si refcount > 0.
-                             # Si refcount es 0 y no hay réplicas, es un candidato a GC si se vuelve a intentar get.
-                             # Para simplificar, no borramos la entrada de metadatos aquí.
-                             pass
-            except asyncio.TimeoutError:
-                print(f"[Store-D] Timeout esperando respuesta de {node_id} para {obj_hash}")
-                continue # Intentar con el siguiente nodo
+                        print(f"[Store-D] No se recibió datos válidos para {msg_id_sent} de {node_id}")
+                except asyncio.TimeoutError:
+                    print(f"[Store-D] Timeout esperando respuesta de {node_id} para {obj_hash} (msg_id: {msg_id_sent})")
+                    self._pending_get_requests.pop(msg_id_sent, None) # Limpiar entrada
+                    continue # Intentar con el siguiente nodo
             except Exception as e:
                 print(f"[Store-D] Error obteniendo {obj_hash} de {node_id}: {e}")
+                # Limpiar entrada si es necesario
+                self._pending_get_requests.pop(msg_id_sent, None) # Asumiendo msg_id_sent existe aquí
                 continue # Intentar con el siguiente nodo
 
         print(f"[Store-D] No se pudo obtener {obj_hash} de ningún nodo conocido.")
         return None
+
 
 
     async def replicate(self, obj_hash: str, target_nodes: List[str]):
@@ -243,34 +230,24 @@ class StoreD:
         for node_id in target_nodes:
             if node_id == self.node_id:
                 continue # No replicar a sí mismo
-
             print(f"[Store-D] Replicando {obj_hash} a {node_id}")
-            replicate_msg = {
-                "magic": "SOD1",
-                "type": "STORE_PUT",
-                "src": self.node_id,
-                "dst": node_id,
-                "msg_id": f"rep_{obj_hash}_{node_id}_{int(time.time())}",
-                "timestamp": int(time.time()),
-                "payload": {
-                    "hash": obj_hash,
-                    "data": data_bytes.hex(), # Enviar como string hexadecimal
-                    "replica": True
-                }
-            }
-
-            try:
-                # Enviar el mensaje de replicación
-                # Asumimos que NetAgent puede manejar el envío fiable o no
-                await self.net_agent.send(replicate_msg, reliable=True) # Opcional: usar canal fiable para replicación
-                print(f"[Store-D] {obj_hash} replicado exitosamente a {node_id}")
-                # Actualizar lista local de réplicas
-                if obj_hash in self.metadata and node_id not in self.metadata[obj_hash]["replicas"]:
-                    self.metadata[obj_hash]["replicas"].append(node_id)
-                    self._save_metadata()
-            except Exception as e:
-                print(f"[Store-D] Error replicando {obj_hash} a {node_id}: {e}")
-
+            # Supongamos que NetAgent puede resolver node_id -> addr internamente
+            # replicate_msg = {
+            #     "magic": "SOD1",
+            #     "type": "STORE_PUT",
+            #     "src": self.node_id,
+            #     "dst": node_id, # <-- Requiere resolución en NetAgent
+            #     "msg_id": f"rep_{obj_hash}_{node_id}_{int(time.time())}",
+            #     "timestamp": int(time.time()),
+            #     "payload": {
+            #         "hash": obj_hash,
+            #         "data": data_bytes.hex(), # Enviar como string hexadecimal
+            #         "replica": True
+            #     }
+            # }
+            # await self.net_agent.send_to_node_id(node_id, replicate_msg["type"], replicate_msg["payload"], reliable=True)
+            # Por ahora, simulamos que no se puede enviar sin el mapeo.
+            print(f"[Store-D] No se puede replicar a {node_id} sin mapeo de dirección. (Pendiente implementar en NetAgent)")
 
     async def _ensure_replication(self, obj_hash: str):
         """
@@ -280,38 +257,14 @@ class StoreD:
         current_replicas = set(self.list_replicas(obj_hash))
         if len(current_replicas) < self.r_copies:
             print(f"[Store-D] Iniciando replicación para {obj_hash} (actual: {len(current_replicas)}, objetivo: {self.r_copies})")
-            # Aquí necesitas una forma de obtener nodos candidatos para replicar
-            # Por ejemplo, usar Discover para obtener nodos disponibles
-            # Supongamos que tenemos un método en Discover o en el propio NetAgent
-            # Por ahora, un stub que obtiene nodos de ejemplo
-            # candidate_nodes = await self.discover_agent.get_available_nodes(exclude=[self.node_id])
-            # Por simplicidad, usamos un stub que devuelve una lista fija o vacía
-            candidate_nodes = await self._get_candidate_nodes_for_replication(exclude=[self.node_id] + list(current_replicas))
-            nodes_to_replicate_to = [n for n in candidate_nodes if n not in current_replicas][:self.r_copies - len(current_replicas)]
+            # Usar nodos conocidos de NetAgent
+            all_known_nodes = self.net_agent.get_known_nodes()
+            candidate_nodes = [n for n in all_known_nodes if n not in current_replicas and n != self.node_id]
+            nodes_to_replicate_to = candidate_nodes[:self.r_copies - len(current_replicas)]
             if nodes_to_replicate_to:
                 await self.replicate(obj_hash, nodes_to_replicate_to)
             else:
                 print(f"[Store-D] No se encontraron nodos candidatos para replicar {obj_hash}.")
-
-
-    async def _get_candidate_nodes_for_replication(self, exclude: List[str]) -> List[str]:
-        """
-        Stub: Obtener nodos candidatos para replicación.
-        En la implementación real, esto debería consultar a Discover o usar otra lógica.
-        """
-        # Este es un stub. En la práctica, usarías DiscoverAgent o un servicio de nodos conocidos.
-        # Por ejemplo, podría llamar a DiscoverAgent.get_neighbors() o una función similar
-        # y aplicar filtros (salud, reputación, carga).
-        # Por ahora, devolvemos una lista vacía o una simulación.
-        # Supongamos que NetAgent o Discover puede proveer esta info.
-        # return await self.discover_agent.get_nodes_suitable_for_replication(exclude=exclude)
-        # Para el simulador, devolvemos una lista simulada de nodos vecinos.
-        # En un entorno real, esto debería integrarse con DiscoverAgent.
-        all_known_nodes = getattr(self.net_agent, 'known_nodes', set()) # Suponiendo que NetAgent mantenga una lista
-        available_nodes = list(all_known_nodes - set(exclude))
-        #print(f"[Store-D] Candidatos para replicación (excluyendo {exclude}): {available_nodes}")
-        return available_nodes
-
 
     def garbage_collect(self):
         """
@@ -342,15 +295,19 @@ class StoreD:
             self._save_metadata()
 
     # --- Manejo de Mensajes de Red ---
-    # Este método debe ser llamado por NetAgent cuando recibe un mensaje dirigido a Store-D
-    async def handle_message(self, msg: Dict[str, Any]):
+    async def handle_message(self, msg: Dict[str, Any], addr: Tuple[str, int]):
         """
         Maneja mensajes entrantes dirigidos al Store-D.
         Debe ser llamado por el agente de red.
         """
         msg_type = msg.get("type")
         src = msg.get("src")
+        original_msg_id = msg.get("msg_id") # <-- Obtener el msg_id ORIGINAL del mensaje recibido (STORE_GET)
         payload = msg.get("payload", {})
+
+        # Añadir src a nodos conocidos de NetAgent
+        if src and src != self.node_id:
+            self.net_agent.add_known_node(src)
 
         if msg_type == "STORE_PUT":
             obj_hash = payload.get("hash")
@@ -376,8 +333,6 @@ class StoreD:
                     else:
                         if src not in self.metadata[obj_hash]["replicas"]:
                             self.metadata[obj_hash]["replicas"].append(src)
-                        # No se incrementa refcount si es replica, solo si es un PUT inicial
-                        # Si es un PUT inicial (no replica), incrementamos refcount
                         if not is_replica:
                             self.metadata[obj_hash]["refcount"] += 1
 
@@ -393,33 +348,72 @@ class StoreD:
             if file_path.exists():
                 with open(file_path, 'rb') as f:
                     data_bytes = f.read()
-                response_msg = {
-                    "magic": "SOD1",
-                    "type": "STORE_FOUND",
-                    "src": self.node_id,
-                    "dst": src,
-                    "msg_id": f"found_{obj_hash}_{int(time.time())}",
-                    "timestamp": int(time.time()),
-                    "payload": {
-                        "hash": obj_hash,
-                        "data": data_bytes.hex() # Enviar como string hexadecimal
-                    }
+                response_msg_payload = {
+                    "hash": obj_hash,
+                    "data": data_bytes.hex(), # Enviar como string hexadecimal
+                    "request_id": original_msg_id # <-- INCLUIR EL MSG_ID ORIGINAL
                 }
-                print(f"[Store-D] Enviando STORE_FOUND para {obj_hash} a {src}")
+                print(f"[Store-D] Enviando STORE_FOUND para {obj_hash} a {src}, respuesta a {original_msg_id}")
+                # Enviar respuesta - Requiere que NetAgent maneje dst como node_id
+                try:
+                    await self.net_agent.send_to_node_id(src, "STORE_FOUND", response_msg_payload, reliable=False, qos='DATA')
+                    print(f"[Store-D] (Real) Enviado STORE_FOUND a {src}")
+                except Exception as e_send:
+                    print(f"[Store-D] Error al enviar STORE_FOUND a {src}: {e_send}")
             else:
-                response_msg = {
-                    "magic": "SOD1",
-                    "type": "STORE_NOT_FOUND",
-                    "src": self.node_id,
-                    "dst": src,
-                    "msg_id": f"not_found_{obj_hash}_{int(time.time())}",
-                    "timestamp": int(time.time()),
-                    "payload": {"hash": obj_hash}
+                response_msg_payload = {
+                    "hash": obj_hash,
+                    "request_id": original_msg_id # <-- INCLUIR EL MSG_ID ORIGINAL
                 }
-                print(f"[Store-D] Enviando STORE_NOT_FOUND para {obj_hash} a {src}")
+                print(f"[Store-D] Enviando STORE_NOT_FOUND para {obj_hash} a {src}, respuesta a {original_msg_id}")
+                try:
+                    await self.net_agent.send_to_node_id(src, "STORE_NOT_FOUND", response_msg_payload, reliable=False, qos='DATA')
+                    print(f"[Store-D] (Real) Enviado STORE_NOT_FOUND a {src}")
+                except Exception as e_send:
+                    print(f"[Store-D] Error al enviar STORE_NOT_FOUND a {src}: {e_send}")
 
-            # Enviar respuesta
-            await self.net_agent.send(response_msg, reliable=False) # No es crítico, usar canal no fiable
+        elif msg_type == "STORE_FOUND":
+            # Este es el mensaje de respuesta a un STORE_GET
+            obj_hash = payload.get("hash")
+            data_hex = payload.get("data")
+            request_id = payload.get("request_id") # <-- Asumimos que se incluye
+            if obj_hash and data_hex and request_id:
+                try:
+                    data_bytes = bytes.fromhex(data_hex)
+                    received_hash = self._calculate_hash(data_bytes)
+                    if received_hash == obj_hash:
+                        # Buscar la solicitud pendiente asociada a este request_id
+                        if request_id in self._pending_get_requests:
+                            pending_req = self._pending_get_requests[request_id]
+                            pending_req['data'] = data_bytes
+                            pending_req['event'].set() # Liberar el evento de espera
+                            print(f"[Store-D] Recibida respuesta para solicitud {request_id} de {src}.")
+                        else:
+                            print(f"[Store-D] STORE_FOUND recibido para solicitud desconocida {request_id} de {src}.")
+                    else:
+                        print(f"[Store-D] Error en STORE_FOUND: Hash recibido {received_hash} no coincide con {obj_hash}.")
+                except Exception as e_parse:
+                    print(f"[Store-D] Error al procesar STORE_FOUND: {e_parse}")
+            else:
+                print(f"[Store-D] STORE_FOUND recibido sin hash, data o request_id válidos.")
+
+        elif msg_type == "STORE_NOT_FOUND":
+            # Este es el mensaje de respuesta a un STORE_GET
+            obj_hash = payload.get("hash")
+            request_id = payload.get("request_id") # <-- Asumimos que se incluye
+            if obj_hash and request_id:
+                # Buscar la solicitud pendiente
+                if request_id in self._pending_get_requests:
+                    pending_req = self._pending_get_requests[request_id]
+                    # No hay data, pero marcamos que la respuesta fue recibida (y fue negativa)
+                    pending_req['event'].set() # Liberar el evento de espera
+                    print(f"[Store-D] Recibido STORE_NOT_FOUND para solicitud {request_id} de {src}.")
+                else:
+                    print(f"[Store-D] STORE_NOT_FOUND recibido para solicitud desconocida {request_id} de {src}.")
+            else:
+                print(f"[Store-D] STORE_NOT_FOUND recibido sin hash o request_id válidos.")
 
         else:
             print(f"[Store-D] Mensaje desconocido recibido: {msg_type}")
+
+# ... (resto del archivo) ...

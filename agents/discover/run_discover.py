@@ -1,6 +1,10 @@
+# agents/discover/run_discover.py (Modificaciones sugeridas)
+
 import argparse
 import asyncio
+from ..net.net_agent import NetAgent # Ajustar la ruta relativa
 from .main import DiscoverAgent
+from ..health.health import HealthAgent # Ajustar la ruta relativa
 
 def parse_peers(peers_str):
     # peers_str like "127.0.0.1:9001,127.0.0.1:9002"
@@ -12,12 +16,38 @@ def parse_peers(peers_str):
         peers.append((host, int(port)))
     return peers
 
+# --- Nueva función para integrar agentes ---
 async def run_node(node_id, port, peers):
-    agent = DiscoverAgent(node_id=node_id, listen_port=port, peers=peers)
-    await agent.start()
+    # Crear NetAgent
+    net_agent = NetAgent(node_id=node_id, listen_host='127.0.0.1', listen_port=port)
+
+    # Crear HealthAgent con callback opcional y referencia a NetAgent
+    def on_node_down(node_id):
+        print(f"[Main] Nodo {node_id} ha caído. Tomar medidas si es necesario.")
+        # Aquí podrías notificar al SchedulerD, etc.
+
+    health_agent = HealthAgent(node_id=node_id, on_node_down_callback=on_node_down, net_agent=net_agent)
+
+    # Crear DiscoverAgent pasándole NetAgent
+    discover_agent = DiscoverAgent(node_id=node_id, net_agent=net_agent, peers=peers)
+
+    # Iniciar NetAgent
+    await net_agent.start()
+    # Iniciar HealthAgent
+    health_agent.start()
+    # Iniciar DiscoverAgent
+    await discover_agent.start()
+
+    print(f"[{node_id}] Todos los agentes iniciados.")
+
     # run forever
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except KeyboardInterrupt:
+        print(f"\n[{node_id}] Cerrando agentes...")
+        health_agent.stop()
+        await net_agent.stop()
 
 def main():
     parser = argparse.ArgumentParser()
