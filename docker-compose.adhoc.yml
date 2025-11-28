@@ -1,22 +1,22 @@
-# docker-compose.adhoc.yml
-# Este archivo se usa para desplegar un NODO ÚNICO en una máquina física
-# que forma parte de la red Ad hoc.
-
 version: '3.8'
 
 services:
   nodo-so:
     build:
-      context: .
-      dockerfile: Dockerfile.nodo
-    container_name: so_nodo
-    network_mode: "host" # <-- CLAVE: Usar la red del host para la red Ad hoc
+      context: . # El contexto es el directorio actual donde está este archivo
+      dockerfile: Dockerfile.nodo # Asume que tienes un Dockerfile llamado Dockerfile.nodo
+    container_name: so_nodo # Nombre fijo para el contenedor
+    network_mode: "host" # <-- CLAVE: Usa la red del host directamente
     environment:
-      - NODE_ID=${NODE_ID:-nodo_adhoc_default}
-      - NODE_PORT=${NODE_PORT:-10000}
-      # Lista de peers en la red Ad hoc, separados por comas (ej: "192.168.1.10:10000,192.168.1.11:10000")
-      - NODE_PEERS=${NODE_PEERS:-}
+      # Pasar las variables de entorno definidas en start_adhoc_node.sh
+      - NODE_ID=${NODE_ID:-nodo_default} # ID único del nodo, con valor por defecto
+      - NODE_PORT=${NODE_PORT:-10000}    # Puerto local donde escucha run_node.py
+      # Los peers se pasan como una cadena de texto
+      - NODE_PEERS=${NODE_PEERS:-""}     # Lista de peers en formato IP:PORT,IP:PORT,...
     volumes:
-      # El store necesita persistencia en el host
+      # Montar un volumen para persistencia del store_d local
+      # Asegura que la carpeta ./store_local exista en el host antes de iniciar
       - ./store_local:/app/store_local
-    restart: unless-stopped
+    restart: unless-stopped # Reiniciar el contenedor si falla, a menos que se detenga manualmente
+    # No es necesario el bloque 'ports' cuando se usa network_mode: "host"
+    # Los puertos se exponen directamente en la instancia anfitriona

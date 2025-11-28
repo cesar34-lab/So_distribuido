@@ -1,7 +1,8 @@
-# So_distribuido/run_node.py (Versión modificada y testeable)
 
 import argparse
 import asyncio
+import os
+
 from agents.net.net_agent import NetAgent
 from agents.health.health import HealthAgent
 from agents.discover.main import DiscoverAgent
@@ -9,27 +10,35 @@ from agents.store_d.store import StoreD
 from agents.scheduler_d.scheduler import SchedulerD
 from agents.leader_election.leader_election import LeaderElectionAgent
 
-def parse_peers(peers_str):
+
+def parse_peers(peers_str: str):
     if not peers_str:
         return []
     peers = []
     for p in peers_str.split(','):
+        p = p.strip()
+        if not p:
+            continue
         host, port = p.split(':')
         peers.append((host, int(port)))
     return peers
 
+
 def on_node_down(node_id):
     print(f"[Node Runner] Nodo {node_id} ha caído.")
 
+
 def on_become_leader():
     print(f"[Node Runner] ¡Este nodo se ha convertido en el LÍDER!")
-    # Aquí podrías iniciar servicios específicos del líder, como un coordinador centralizado temporal.
+
 
 def on_leader_changed(new_leader_id):
     print(f"[Node Runner] El nuevo líder es: {new_leader_id}")
 
+
 async def run_node(node_id, port, peers, test_mode=False):
     print(f"Iniciando nodo {node_id} en puerto {port}")
+    print(f"Peers configurados: {peers if peers else 'ninguno'}")
 
     # 1. Crear NetAgent (base de comunicación)
     net_agent = NetAgent(node_id=node_id, listen_host='127.0.0.1', listen_port=port)
@@ -72,7 +81,7 @@ async def run_node(node_id, port, peers, test_mode=False):
     # 11. Iniciar tareas de limpieza para StoreD (simulado con una tarea periódica)
     async def gc_task():
         while True:
-            await asyncio.sleep(300 if not test_mode else 1) # Cada 5 minutos o 1 segundo en test
+            await asyncio.sleep(300 if not test_mode else 1)  # Cada 5 minutos o 1 segundo en test
             store_agent.garbage_collect()
 
     asyncio.create_task(gc_task())
@@ -83,11 +92,10 @@ async def run_node(node_id, port, peers, test_mode=False):
     try:
         iteration_count = 0
         while True:
-            # En modo test, salir después de unas pocas iteraciones
             if test_mode and iteration_count >= 3:
                 print(f"[{node_id}] Modo test: Saliendo del bucle principal.")
                 break
-            await asyncio.sleep(3600 if not test_mode else 0.1) # Dormir 1h o 0.1s en test
+            await asyncio.sleep(3600 if not test_mode else 0.1)
             iteration_count += 1
     except KeyboardInterrupt:
         print(f"\n[{node_id}] Cerrando agentes...")
@@ -95,14 +103,40 @@ async def run_node(node_id, port, peers, test_mode=False):
         health_agent.stop()
         await net_agent.stop()
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--id", required=True, help="Node ID")
-    parser.add_argument("--port", required=True, type=int, help="UDP listen port")
-    parser.add_argument("--peers", help="comma separated host:port list")
+
+    parser.add_argument(
+        "--id",
+        default=os.getenv("NODE_ID", "nodo_adhoc_default"),
+        help="Node ID (por defecto tomado de la variable de entorno NODE_ID)"
+    )
+
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("NODE_PORT", "10000")),
+        help="UDP listen port (por defecto tomado de NODE_PORT)"
+    )
+
+    parser.add_argument(
+        "--peers",
+        default=os.getenv("NODE_PEERS", ""),
+        help="comma separated host:port list (por defecto tomada de NODE_PEERS)"
+    )
+
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Ejecutar el nodo en modo test (bucles rápidos y salida temprana)"
+    )
+
     args = parser.parse_args()
+
     peers = parse_peers(args.peers)
-    asyncio.run(run_node(args.id, args.port, peers))
+    asyncio.run(run_node(args.id, args.port, peers, test_mode=args.test))
+
 
 if __name__ == "__main__":
-    main()
+        main()

@@ -1,44 +1,38 @@
 #!/bin/bash
 #
 # Script para iniciar un nodo del Sistema Operativo Descentralizado
-# en una red Ad hoc.
+# en AWS EC2 (simulando red Ad hoc via IP directa).
 #
 # Uso:
-#   ./start_adhoc_node.sh <ID_DEL_NODO>
+#   ./start_adhoc_node.sh <ID_DEL_NODO> <PUERTO_LOCAL> "<PEERS_IP:PUERTO,...>"
 #
 # Ejemplo:
-#   ./start_adhoc_node.sh nodo_maestro
-#   ./start_adhoc_node.sh nodo_trabajador_1
+#   ./start_adhoc_node.sh nodo_maestro 10000 "172.31.10.11:10000,172.31.10.12:10000"
+#   (Ajustando IPs al CIDR de tu VPC/subred de AWS)
 
-if [ -z "$1" ]; then
-  echo "Error: Debes proporcionar un ID de nodo."
-  echo "Uso: $0 <ID_DEL_NODO>"
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
+  echo "Error: Debes proporcionar ID del nodo, puerto local y peers."
+  echo "Uso: $0 <ID_DEL_NODO> <PUERTO_LOCAL> \"<PEERS_IP:PUERTO,...>\""
+  echo "Ejemplo: $0 nodo_maestro 10000 \"192.168.10.51:10000,192.168.10.52:10000,192.168.10.37:10000\""
   exit 1
 fi
 
 NODE_ID="$1"
-NODE_PORT="10000" # Puerto por defecto, puedes cambiarlo
+NODE_PORT="$2"
+NODE_PEERS="$3"
 
-# --- Configuración de la Red Ad hoc (ejemplo para Linux con iwconfig) ---
-# AJUSTA ESTOS PARÁMETROS A TU TARJETA DE RED Y CONFIGURACIÓN DESEADA
-WIFI_INTERFACE="wlan0"
-ADHOC_SSID="SO-Descentralizado"
-ADHOC_CHANNEL="6"
+echo "Iniciando nodo con ID: $NODE_ID, Puerto: $NODE_PORT, Peers: $NODE_PEERS"
 
-echo "Configurando la interfaz $WIFI_INTERFACE en modo Ad hoc..."
-sudo iwconfig $WIFI_INTERFACE mode ad-hoc essid $ADHOC_SSID channel $ADHOC_CHANNEL
-sudo ip link set $WIFI_INTERFACE up
-echo "Interfaz $WIFI_INTERFACE configurada."
+# --- NO hay configuración de red Ad hoc aquí, ya que usamos la VPC de AWS ---
 
 # --- Iniciar el nodo con Docker Compose ---
-echo "Iniciando el nodo del Sistema Operativo Descentralizado con ID: $NODE_ID"
 export NODE_ID=$NODE_ID
 export NODE_PORT=$NODE_PORT
-# Si conoces los peers al momento de iniciar, puedes definirlos aquí
-# export NODE_PEERS="192.168.1.10:10000"
+export NODE_PEERS=$NODE_PEERS
 
-docker-compose -f docker-compose.adhoc.yml up -d
+# Asegúrate de que el compose file use network_mode: "host" o exponga los puertos necesarios
+# Si usas host, los puertos del contenedor se mapean directamente al host.
+# Si usas puertos mapeados, debes ajustar las IPs/ports de los peers en consecuencia.
+# Para esta guía, asumiremos network_mode: "host".
 
-echo "¡Nodo iniciado! Verifica su estado con:"
-echo "  docker logs so_nodo"
-echo "  curl http://localhost:10000/estado"
+# Usamos 'docker compose' en lugar de 'docker-compose'
